@@ -490,9 +490,10 @@ def play_wav(path: Path, sample_rate: int, samples: list[int]) -> None:
         return
 
     if sys.platform.startswith("win"):
+        escaped_path = str(path).replace("'", "''")
         cmd = (
             "Add-Type -AssemblyName presentationCore;"
-            f"(New-Object Media.SoundPlayer '{str(path).replace("'", "''")}').PlaySync();"
+            f"(New-Object Media.SoundPlayer '{escaped_path}').PlaySync();"
         )
         subprocess.run(["powershell", "-NoProfile", "-Command", cmd], check=True)
         return
