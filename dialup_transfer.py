@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 import argparse
 import hashlib
+import hmac
 import json
 import math
 import os
 import random
+import secrets
 import shutil
 import socket
 import struct
@@ -21,6 +23,20 @@ PROTOCOL_VERSION = 1
 ACOUSTIC_MAGIC = b"DUF1"
 ACOUSTIC_SYNC = b"DIALUPSYNC"
 ACOUSTIC_PREAMBLE_BITS = 192
+
+MAX_LAN_HEADER_BYTES = 16 * 1024
+MAX_LAN_FILE_BYTES = 512 * 1024 * 1024
+MAX_ACOUSTIC_HEADER_BYTES = 16 * 1024
+DEFAULT_MAX_ACOUSTIC_PAYLOAD_BYTES = 2 * 1024 * 1024
+MAX_ACOUSTIC_PAYLOAD_BYTES = 16 * 1024 * 1024
+DEFAULT_MAX_RECORD_SECONDS = 180.0
+MIN_RECORD_SECONDS = 1.0
+MIN_ACOUSTIC_SAMPLE_RATE = 8000
+MAX_ACOUSTIC_SAMPLE_RATE = 96000
+MIN_ACOUSTIC_BAUD = 20
+MAX_ACOUSTIC_BAUD = 600
+MIN_TONE_HZ = 300
+MAX_TONE_HZ = 4800
 
 
 class DialupFX:
@@ -73,7 +89,81 @@ def sha256sum(path: Path) -> str:
     return h.hexdigest()
 
 
-def recv_line(sock: socket.socket) -> bytes:
+def sanitize_log_text(text: str, limit: int = 120) -> str:
+    cleaned = []
+    for ch in text:
+        if ch in ("\n", "\r", "\t"):
+            cleaned.append(" ")
+        elif 32 <= ord(ch) <= 126:
+            cleaned.append(ch)
+        else:
+            cleaned.append(".")
+    out = "".join(cleaned).strip()
+    return out[:limit]
+
+
+def validate_acoustic_parameters(
+    sample_rate: int,
+    baud: int,
+    f0: int,
+    f1: int,
+    record_seconds: float | None = None,
+    max_payload_bytes: int | None = None,
+) -> None:
+    if not (MIN_ACOUSTIC_SAMPLE_RATE <= sample_rate <= MAX_ACOUSTIC_SAMPLE_RATE):
+        raise ValueError(
+            f"sample-rate out of range ({MIN_ACOUSTIC_SAMPLE_RATE}-{MAX_ACOUSTIC_SAMPLE_RATE}): {sample_rate}"
+        )
+    if not (MIN_ACOUSTIC_BAUD <= baud <= MAX_ACOUSTIC_BAUD):
+        raise ValueError(f"baud out of range ({MIN_ACOUSTIC_BAUD}-{MAX_ACOUSTIC_BAUD}): {baud}")
+    if not (MIN_TONE_HZ <= f0 <= MAX_TONE_HZ) or not (MIN_TONE_HZ <= f1 <= MAX_TONE_HZ):
+        raise ValueError(f"tone frequencies must be in {MIN_TONE_HZ}-{MAX_TONE_HZ} Hz")
+    if abs(f1 - f0) < 200:
+        raise ValueError("f0 and f1 are too close; use at least 200 Hz separation")
+    if record_seconds is not None:
+        if not (MIN_RECORD_SECONDS <= record_seconds <= DEFAULT_MAX_RECORD_SECONDS):
+            raise ValueError(
+                f"record-seconds out of range ({MIN_RECORD_SECONDS}-{DEFAULT_MAX_RECORD_SECONDS}): {record_seconds}"
+            )
+    if max_payload_bytes is not None:
+        if max_payload_bytes <= 0 or max_payload_bytes > MAX_ACOUSTIC_PAYLOAD_BYTES:
+            raise ValueError(
+                f"max-acoustic-bytes must be 1..{MAX_ACOUSTIC_PAYLOAD_BYTES}: {max_payload_bytes}"
+            )
+
+
+def derive_auth_key(passphrase: str | None) -> bytes | None:
+    if passphrase is None:
+        return None
+    normalized = passphrase.strip()
+    if not normalized:
+        return None
+    return hashlib.sha256(normalized.encode("utf-8")).digest()
+
+
+def build_auth_material(header: dict) -> bytes:
+    payload = {
+        "version": int(header["version"]),
+        "filename": str(header["filename"]),
+        "size": int(header["size"]),
+        "sha256": str(header["sha256"]),
+        "nonce": str(header["nonce"]),
+        "auth": "hmac-sha256",
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def resolve_passphrase(passphrase: str | None, passphrase_env: str | None) -> str | None:
+    if passphrase and passphrase.strip():
+        return passphrase
+    if passphrase_env:
+        env_value = os.environ.get(passphrase_env, "")
+        if env_value.strip():
+            return env_value
+    return None
+
+
+def recv_line(sock: socket.socket, max_bytes: int = MAX_LAN_HEADER_BYTES) -> bytes:
     data = bytearray()
     while True:
         ch = sock.recv(1)
@@ -82,6 +172,8 @@ def recv_line(sock: socket.socket) -> bytes:
         if ch == b"\n":
             return bytes(data)
         data.extend(ch)
+        if len(data) > max_bytes:
+            raise ValueError("header too large")
 
 
 def throttle_sleep(chunk_size: int, kbps: float, chaos: bool) -> None:
@@ -125,6 +217,8 @@ def send_file(host: str, port: int, file_path: Path, kbps: float, chaos: bool) -
         raise FileNotFoundError(f"file not found: {file_path}")
 
     file_size = file_path.stat().st_size
+    if file_size > MAX_LAN_FILE_BYTES:
+        raise ValueError(f"file too large for LAN mode safety limit ({MAX_LAN_FILE_BYTES} bytes)")
     checksum = sha256sum(file_path)
     header = {
         "version": PROTOCOL_VERSION,
@@ -162,7 +256,7 @@ def send_file(host: str, port: int, file_path: Path, kbps: float, chaos: bool) -
 def handle_client(conn: socket.socket, addr: tuple[str, int], out_dir: Path, kbps: float, chaos: bool) -> None:
     try:
         print(f"\n[RECV] Incoming call from {addr[0]}:{addr[1]}")
-        header_line = recv_line(conn)
+        header_line = recv_line(conn, max_bytes=MAX_LAN_HEADER_BYTES)
         header = json.loads(header_line.decode("utf-8"))
 
         if header.get("version") != PROTOCOL_VERSION:
@@ -173,6 +267,14 @@ def handle_client(conn: socket.socket, addr: tuple[str, int], out_dir: Path, kbp
         filename = str(header["filename"])
         total_size = int(header["size"])
         expected_sha = str(header["sha256"])
+        if total_size < 0:
+            conn.sendall(b"ERR invalid size\n")
+            print("[RECV] Invalid file size")
+            return
+        if total_size > MAX_LAN_FILE_BYTES:
+            conn.sendall(b"ERR file too large\n")
+            print("[RECV] File rejected: too large")
+            return
 
         out_dir.mkdir(parents=True, exist_ok=True)
         target = unique_target(out_dir, filename)
@@ -250,15 +352,27 @@ def bits_to_bytes(bits: list[int]) -> bytes:
     return bytes(out)
 
 
-def build_acoustic_frame(file_path: Path) -> bytes:
+def build_acoustic_frame(file_path: Path, passphrase: str | None, max_payload_bytes: int) -> bytes:
+    file_size = file_path.stat().st_size
+    if file_size > max_payload_bytes:
+        raise ValueError(f"file too large for acoustic mode limit ({max_payload_bytes} bytes)")
     payload = file_path.read_bytes()
     header = {
         "version": PROTOCOL_VERSION,
         "filename": file_path.name,
-        "size": len(payload),
+        "size": file_size,
         "sha256": hashlib.sha256(payload).hexdigest(),
     }
+
+    key = derive_auth_key(passphrase)
+    if key:
+        header["nonce"] = secrets.token_hex(16)
+        header["auth"] = "hmac-sha256"
+        header["auth_tag"] = hmac.new(key, build_auth_material(header), hashlib.sha256).hexdigest()
+
     header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    if len(header_bytes) > MAX_ACOUSTIC_HEADER_BYTES:
+        raise ValueError("acoustic header too large")
     return (
         ACOUSTIC_MAGIC
         + struct.pack(">IQ", len(header_bytes), len(payload))
@@ -268,13 +382,23 @@ def build_acoustic_frame(file_path: Path) -> bytes:
     )
 
 
-def parse_acoustic_frame(frame: bytes) -> tuple[dict, bytes]:
+def parse_acoustic_frame(
+    frame: bytes,
+    passphrase: str | None,
+    allow_unauthenticated: bool,
+    max_payload_bytes: int,
+) -> tuple[dict, bytes]:
     if len(frame) < 4 + 12 + 32:
         raise ValueError("frame too short")
     if frame[:4] != ACOUSTIC_MAGIC:
         raise ValueError("invalid frame magic")
 
     header_len, payload_len = struct.unpack(">IQ", frame[4:16])
+    if header_len <= 0 or header_len > MAX_ACOUSTIC_HEADER_BYTES:
+        raise ValueError("invalid acoustic header length")
+    if payload_len > max_payload_bytes:
+        raise ValueError("acoustic payload exceeds maximum allowed size")
+
     header_end = 16 + header_len
     payload_end = header_end + payload_len
     digest_end = payload_end + 32
@@ -290,6 +414,25 @@ def parse_acoustic_frame(frame: bytes) -> tuple[dict, bytes]:
         raise ValueError("payload checksum mismatch")
     if int(header.get("size", -1)) != len(payload):
         raise ValueError("size mismatch")
+    if not isinstance(header.get("filename"), str):
+        raise ValueError("invalid filename in acoustic header")
+
+    auth_mode = str(header.get("auth", "")).strip().lower()
+    if auth_mode:
+        if auth_mode != "hmac-sha256":
+            raise ValueError("unsupported acoustic auth mode")
+        auth_tag = str(header.get("auth_tag", ""))
+        nonce = str(header.get("nonce", ""))
+        key = derive_auth_key(passphrase)
+        if key is None:
+            raise ValueError("passphrase is required to verify authenticated acoustic frame")
+        if len(auth_tag) != 64 or len(nonce) < 16:
+            raise ValueError("invalid acoustic authentication metadata")
+        expected_tag = hmac.new(key, build_auth_material(header), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(auth_tag, expected_tag):
+            raise ValueError("acoustic frame authentication failed")
+    elif not allow_unauthenticated:
+        raise ValueError("unauthenticated acoustic frame blocked (use passphrase or --allow-unauthenticated)")
 
     return header, payload
 
@@ -333,12 +476,16 @@ def write_wav(samples: list[int], sample_rate: int, out_path: Path) -> None:
         w.writeframes(struct.pack("<" + "h" * len(samples), *samples))
 
 
-def read_wav_mono16(in_path: Path) -> tuple[int, list[int]]:
+def read_wav_mono16(in_path: Path, max_seconds: float = DEFAULT_MAX_RECORD_SECONDS) -> tuple[int, list[int]]:
     with wave.open(str(in_path), "rb") as w:
         channels = w.getnchannels()
         width = w.getsampwidth()
         rate = w.getframerate()
-        frames = w.readframes(w.getnframes())
+        frame_count = w.getnframes()
+        duration = frame_count / max(rate, 1)
+        if duration > max_seconds:
+            raise ValueError(f"wav too long for safety limit ({duration:.1f}s > {max_seconds:.1f}s)")
+        frames = w.readframes(frame_count)
 
     if width != 2:
         raise ValueError("only 16-bit PCM WAV is supported")
@@ -428,6 +575,8 @@ def demod_bits(samples: list[int], sample_rate: int, baud: int, f0: int, f1: int
 
     if best is None:
         raise ValueError("sync not found in audio")
+    if best[1] < len(sync_bits) + 64:
+        raise ValueError("sync candidate too short")
 
     offset = best[0]
     bits: list[int] = []
@@ -451,7 +600,14 @@ def find_bits(haystack: list[int], needle: list[int]) -> int:
     return -1
 
 
-def decode_packet_from_samples(samples: list[int], sample_rate: int, baud: int, f0: int, f1: int) -> bytes:
+def decode_packet_from_samples(
+    samples: list[int],
+    sample_rate: int,
+    baud: int,
+    f0: int,
+    f1: int,
+    max_frame_bytes: int,
+) -> bytes:
     bits, _ = demod_bits(samples, sample_rate, baud, f0, f1)
     sync_bits = bytes_to_bits(ACOUSTIC_SYNC)
     pos = find_bits(bits, sync_bits)
@@ -463,6 +619,8 @@ def decode_packet_from_samples(samples: list[int], sample_rate: int, baud: int, 
         raise ValueError("missing frame length")
 
     length = struct.unpack(">I", bits_to_bytes(bits[start : start + 32]))[0]
+    if length <= 0 or length > max_frame_bytes:
+        raise ValueError(f"frame length out of allowed range (max {max_frame_bytes} bytes)")
     frame_start = start + 32
     frame_end = frame_start + (length * 8)
     if frame_end > len(bits):
@@ -563,11 +721,26 @@ def acoustic_send(
     baud: int,
     f0: int,
     f1: int,
+    passphrase: str | None,
+    allow_unauthenticated: bool,
+    max_payload_bytes: int,
 ) -> None:
     if not file_path.exists() or not file_path.is_file():
         raise FileNotFoundError(f"file not found: {file_path}")
+    validate_acoustic_parameters(
+        sample_rate=sample_rate,
+        baud=baud,
+        f0=f0,
+        f1=f1,
+        max_payload_bytes=max_payload_bytes,
+    )
+    key = derive_auth_key(passphrase)
+    if key is None and not allow_unauthenticated:
+        raise ValueError("passphrase is required in acoustic-send unless --allow-unauthenticated is used")
+    if key is None and allow_unauthenticated:
+        print("[WARN] Acoustic send is unauthenticated. This is vulnerable to spoofed payloads.")
 
-    frame = build_acoustic_frame(file_path)
+    frame = build_acoustic_frame(file_path, passphrase=passphrase, max_payload_bytes=max_payload_bytes)
     bits = build_packet_bits(frame)
     print("[TXPROG] 0.0")
     samples = synthesize_samples(bits, sample_rate, baud, f0, f1)
@@ -596,11 +769,24 @@ def acoustic_receive(
     wav_in: Path | None,
     record_seconds: float,
     save_recorded_wav: Path | None,
+    passphrase: str | None,
+    allow_unauthenticated: bool,
+    max_payload_bytes: int,
 ) -> None:
+    validate_acoustic_parameters(
+        sample_rate=sample_rate,
+        baud=baud,
+        f0=f0,
+        f1=f1,
+        record_seconds=record_seconds,
+        max_payload_bytes=max_payload_bytes,
+    )
+    if derive_auth_key(passphrase) is None and allow_unauthenticated:
+        print("[WARN] Acoustic receive accepts unauthenticated frames. Use passphrase in production.")
     print("[LAMP] RED")
     print("[RXPROG] 0.0")
     if wav_in:
-        read_rate, samples = read_wav_mono16(wav_in)
+        read_rate, samples = read_wav_mono16(wav_in, max_seconds=DEFAULT_MAX_RECORD_SECONDS)
         if read_rate != sample_rate:
             raise ValueError(f"wav sample rate mismatch: expected {sample_rate}, got {read_rate}")
         print(f"[ACOUSTIC RECV] Decoding WAV: {wav_in}")
@@ -618,12 +804,18 @@ def acoustic_receive(
             print(f"[ACOUSTIC RECV] Raw recording saved: {save_recorded_wav}")
 
     print("[ACOUSTIC RECV] Demodulating...")
-    frame = decode_packet_from_samples(samples, sample_rate, baud, f0, f1)
+    max_frame_bytes = 4 + 12 + MAX_ACOUSTIC_HEADER_BYTES + max_payload_bytes + 32
+    frame = decode_packet_from_samples(samples, sample_rate, baud, f0, f1, max_frame_bytes=max_frame_bytes)
     print("[RXPROG] 92.0")
-    header, payload = parse_acoustic_frame(frame)
-    preview = payload[:240].decode("utf-8", errors="ignore").replace("\n", " ")
+    header, payload = parse_acoustic_frame(
+        frame,
+        passphrase=passphrase,
+        allow_unauthenticated=allow_unauthenticated,
+        max_payload_bytes=max_payload_bytes,
+    )
+    preview = sanitize_log_text(payload[:240].decode("utf-8", errors="ignore"), limit=120)
     if preview:
-        print(f"[ASCII] {preview[:120]}")
+        print(f"[ASCII] {preview}")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     target = unique_target(out_dir, str(header.get("filename", "received.bin")))
@@ -669,6 +861,23 @@ def build_parser() -> argparse.ArgumentParser:
     asend.add_argument("--baud", type=int, default=80)
     asend.add_argument("--f0", type=int, default=1200, help="Frequency for bit 0")
     asend.add_argument("--f1", type=int, default=2200, help="Frequency for bit 1")
+    asend.add_argument("--passphrase", help="Shared passphrase for authenticated acoustic frames")
+    asend.add_argument(
+        "--passphrase-env",
+        default="DIALUP_PASSPHRASE",
+        help="Environment variable to read passphrase from (default: DIALUP_PASSPHRASE)",
+    )
+    asend.add_argument(
+        "--allow-unauthenticated",
+        action="store_true",
+        help="Allow unauthenticated acoustic frames (unsafe; for compatibility only)",
+    )
+    asend.add_argument(
+        "--max-acoustic-bytes",
+        type=int,
+        default=DEFAULT_MAX_ACOUSTIC_PAYLOAD_BYTES,
+        help=f"Maximum acoustic payload bytes (1..{MAX_ACOUSTIC_PAYLOAD_BYTES})",
+    )
 
     arecv = sub.add_parser("acoustic-receive", help="Record from mic and decode transfer audio")
     arecv.add_argument("--out-dir", default="received", help="Save directory")
@@ -679,6 +888,23 @@ def build_parser() -> argparse.ArgumentParser:
     arecv.add_argument("--record-seconds", type=float, default=30.0)
     arecv.add_argument("--wav-in", help="Decode from existing WAV instead of mic capture")
     arecv.add_argument("--save-recorded-wav", help="Save raw mic capture WAV")
+    arecv.add_argument("--passphrase", help="Shared passphrase for authenticated acoustic frames")
+    arecv.add_argument(
+        "--passphrase-env",
+        default="DIALUP_PASSPHRASE",
+        help="Environment variable to read passphrase from (default: DIALUP_PASSPHRASE)",
+    )
+    arecv.add_argument(
+        "--allow-unauthenticated",
+        action="store_true",
+        help="Allow unauthenticated acoustic frames (unsafe; for compatibility only)",
+    )
+    arecv.add_argument(
+        "--max-acoustic-bytes",
+        type=int,
+        default=DEFAULT_MAX_ACOUSTIC_PAYLOAD_BYTES,
+        help=f"Maximum acoustic payload bytes (1..{MAX_ACOUSTIC_PAYLOAD_BYTES})",
+    )
 
     return parser
 
@@ -705,6 +931,7 @@ def main() -> int:
                 chaos=args.chaos,
             )
         elif args.mode == "acoustic-send":
+            passphrase = resolve_passphrase(args.passphrase, args.passphrase_env)
             acoustic_send(
                 file_path=Path(args.file),
                 wav_out=Path(args.wav_out),
@@ -713,8 +940,12 @@ def main() -> int:
                 baud=args.baud,
                 f0=args.f0,
                 f1=args.f1,
+                passphrase=passphrase,
+                allow_unauthenticated=args.allow_unauthenticated,
+                max_payload_bytes=args.max_acoustic_bytes,
             )
         elif args.mode == "acoustic-receive":
+            passphrase = resolve_passphrase(args.passphrase, args.passphrase_env)
             acoustic_receive(
                 out_dir=Path(args.out_dir),
                 sample_rate=args.sample_rate,
@@ -724,6 +955,9 @@ def main() -> int:
                 wav_in=Path(args.wav_in) if args.wav_in else None,
                 record_seconds=args.record_seconds,
                 save_recorded_wav=Path(args.save_recorded_wav) if args.save_recorded_wav else None,
+                passphrase=passphrase,
+                allow_unauthenticated=args.allow_unauthenticated,
+                max_payload_bytes=args.max_acoustic_bytes,
             )
         else:
             parser.print_help()

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
+import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -63,6 +65,8 @@ class DialupGUI(tk.Tk):
         self.recv_outdir = tk.StringVar(value="received")
         self.recv_chaos = tk.BooleanVar(value=True)
         self.recv_record_seconds = tk.StringVar(value="30")
+        self.recv_passphrase = tk.StringVar(value="")
+        self.recv_allow_unauth = tk.BooleanVar(value=False)
 
         self._row(parent, 0, "Transport", self.recv_transport, is_combo=True, options=["lan", "acoustic"])
         self._row(parent, 1, "Bind Host", self.recv_host)
@@ -70,40 +74,45 @@ class DialupGUI(tk.Tk):
         self._row(parent, 3, "Speed (kbps)", self.recv_speed)
         self._row(parent, 4, "Output Dir", self.recv_outdir)
         self._row(parent, 5, "Record Seconds", self.recv_record_seconds)
+        ttk.Label(parent, text="Acoustic Passphrase").grid(row=6, column=0, sticky="w", padx=(0, 10), pady=4)
+        ttk.Entry(parent, textvariable=self.recv_passphrase, show="*").grid(row=6, column=1, sticky="ew", pady=4)
 
         ttk.Checkbutton(parent, text="Chaos mode (LAN only)", variable=self.recv_chaos).grid(
-            row=6, column=1, sticky="w", pady=(4, 8)
+            row=7, column=1, sticky="w", pady=(4, 2)
+        )
+        ttk.Checkbutton(parent, text="Allow unauthenticated acoustic frames (unsafe)", variable=self.recv_allow_unauth).grid(
+            row=8, column=1, sticky="w", pady=(0, 8)
         )
 
         btns = ttk.Frame(parent)
-        btns.grid(row=7, column=1, sticky="w")
+        btns.grid(row=9, column=1, sticky="w")
         self.start_recv_btn = ttk.Button(btns, text="Start Receiver", command=self.start_receiver)
         self.start_recv_btn.pack(side="left", padx=(0, 8))
         self.stop_recv_btn = ttk.Button(btns, text="Stop Receiver", command=self.stop_receiver, state="disabled")
         self.stop_recv_btn.pack(side="left")
 
         status = ttk.Frame(parent)
-        status.grid(row=8, column=1, sticky="ew", pady=(10, 2))
+        status.grid(row=10, column=1, sticky="ew", pady=(10, 2))
         status.columnconfigure(1, weight=1)
         ttk.Label(status, text="Receive Progress").grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.recv_progress = ttk.Progressbar(status, mode="determinate", maximum=100)
         self.recv_progress.grid(row=0, column=1, sticky="ew")
 
         lamp_row = ttk.Frame(parent)
-        lamp_row.grid(row=9, column=1, sticky="w", pady=(8, 4))
+        lamp_row.grid(row=11, column=1, sticky="w", pady=(8, 4))
         ttk.Label(lamp_row, text="Receive Lamp").pack(side="left", padx=(0, 8))
         self.lamp_canvas = tk.Canvas(lamp_row, width=20, height=20, highlightthickness=0)
         self.lamp_canvas.pack(side="left")
         self.lamp_led = self.lamp_canvas.create_oval(2, 2, 18, 18, fill="#9a1f1f", outline="#451010")
 
         preview_wrap = ttk.LabelFrame(parent, text="Live Data Text", padding=6)
-        preview_wrap.grid(row=10, column=1, sticky="ew", pady=(4, 4))
+        preview_wrap.grid(row=12, column=1, sticky="ew", pady=(4, 4))
         self.preview_text = tk.Text(preview_wrap, height=4, wrap="word", font=("Courier", 10))
         self.preview_text.pack(fill="x", expand=True)
         self.preview_text.configure(state="disabled")
 
         span_wrap = ttk.LabelFrame(parent, text="Live Spana", padding=6)
-        span_wrap.grid(row=11, column=1, sticky="ew", pady=(4, 2))
+        span_wrap.grid(row=13, column=1, sticky="ew", pady=(4, 2))
         self.span_canvas = tk.Canvas(span_wrap, width=560, height=110, bg="#0c0f10", highlightthickness=0)
         self.span_canvas.pack(fill="x", expand=True)
         self._draw_spectrum([0] * 28)
@@ -116,6 +125,8 @@ class DialupGUI(tk.Tk):
         self.send_file = tk.StringVar(value="")
         self.send_chaos = tk.BooleanVar(value=True)
         self.send_play_audio = tk.BooleanVar(value=True)
+        self.send_passphrase = tk.StringVar(value="")
+        self.send_allow_unauth = tk.BooleanVar(value=False)
 
         self._row(parent, 0, "Transport", self.send_transport, is_combo=True, options=["lan", "acoustic"])
         self._row(parent, 1, "Receiver Host", self.send_host)
@@ -135,12 +146,17 @@ class DialupGUI(tk.Tk):
         ttk.Checkbutton(parent, text="Play through speaker (Acoustic only)", variable=self.send_play_audio).grid(
             row=6, column=1, sticky="w", pady=(0, 8)
         )
+        ttk.Label(parent, text="Acoustic Passphrase").grid(row=7, column=0, sticky="w", padx=(0, 10), pady=4)
+        ttk.Entry(parent, textvariable=self.send_passphrase, show="*").grid(row=7, column=1, sticky="ew", pady=4)
+        ttk.Checkbutton(parent, text="Allow unauthenticated acoustic send (unsafe)", variable=self.send_allow_unauth).grid(
+            row=8, column=1, sticky="w", pady=(0, 8)
+        )
 
         self.send_btn = ttk.Button(parent, text="Send File", command=self.send_once)
-        self.send_btn.grid(row=7, column=1, sticky="w")
+        self.send_btn.grid(row=9, column=1, sticky="w")
 
         progress_row = ttk.Frame(parent)
-        progress_row.grid(row=8, column=1, sticky="ew", pady=(8, 2))
+        progress_row.grid(row=10, column=1, sticky="ew", pady=(8, 2))
         progress_row.columnconfigure(1, weight=1)
         ttk.Label(progress_row, text="Send Progress").grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.send_progress = ttk.Progressbar(progress_row, mode="determinate", maximum=100)
@@ -175,11 +191,20 @@ class DialupGUI(tk.Tk):
             return
 
         transport = self.recv_transport.get().strip().lower()
+        extra_env: dict[str, str] | None = None
         self.recv_progress.configure(value=0)
         self._set_lamp("red")
         self._append_preview("")
         self._draw_spectrum([0] * 28)
         if transport == "acoustic":
+            passphrase = self.recv_passphrase.get().strip()
+            allow_unauth = self.recv_allow_unauth.get()
+            if not passphrase and not allow_unauth:
+                messagebox.showerror(
+                    "Passphrase required",
+                    "Acoustic receive requires passphrase unless unauthenticated mode is explicitly enabled.",
+                )
+                return
             cmd = [
                 sys.executable,
                 str(self.cli_path),
@@ -189,6 +214,11 @@ class DialupGUI(tk.Tk):
                 "--record-seconds",
                 self.recv_record_seconds.get().strip(),
             ]
+            if passphrase:
+                cmd.extend(["--passphrase-env", "DIALUP_PASSPHRASE"])
+                extra_env = {"DIALUP_PASSPHRASE": passphrase}
+            if allow_unauth:
+                cmd.append("--allow-unauthenticated")
         else:
             cmd = [
                 sys.executable,
@@ -207,7 +237,7 @@ class DialupGUI(tk.Tk):
                 cmd.append("--chaos")
 
         try:
-            self.receiver_proc = self._spawn(cmd, "[RECV]")
+            self.receiver_proc = self._spawn(cmd, "[RECV]", extra_env=extra_env)
             self.start_recv_btn.configure(state="disabled")
             self.stop_recv_btn.configure(state="normal")
             threading.Thread(target=self._wait_receiver, daemon=True).start()
@@ -244,8 +274,17 @@ class DialupGUI(tk.Tk):
             return
 
         transport = self.send_transport.get().strip().lower()
+        extra_env: dict[str, str] | None = None
         self.send_progress.configure(value=0)
         if transport == "acoustic":
+            passphrase = self.send_passphrase.get().strip()
+            allow_unauth = self.send_allow_unauth.get()
+            if not passphrase and not allow_unauth:
+                messagebox.showerror(
+                    "Passphrase required",
+                    "Acoustic send requires passphrase unless unauthenticated mode is explicitly enabled.",
+                )
+                return
             cmd = [
                 sys.executable,
                 str(self.cli_path),
@@ -255,6 +294,11 @@ class DialupGUI(tk.Tk):
             ]
             if not self.send_play_audio.get():
                 cmd.append("--no-play")
+            if passphrase:
+                cmd.extend(["--passphrase-env", "DIALUP_PASSPHRASE"])
+                extra_env = {"DIALUP_PASSPHRASE": passphrase}
+            if allow_unauth:
+                cmd.append("--allow-unauthenticated")
         else:
             cmd = [
                 sys.executable,
@@ -273,7 +317,7 @@ class DialupGUI(tk.Tk):
                 cmd.append("--chaos")
 
         try:
-            self.sender_proc = self._spawn(cmd, "[SEND]")
+            self.sender_proc = self._spawn(cmd, "[SEND]", extra_env=extra_env)
             self.send_btn.configure(state="disabled")
             threading.Thread(target=self._wait_sender, daemon=True).start()
         except Exception as e:
@@ -289,11 +333,29 @@ class DialupGUI(tk.Tk):
         self.sender_proc = None
         self.after(0, lambda: self.send_btn.configure(state="normal"))
 
-    def _spawn(self, cmd: list[str], tag: str) -> subprocess.Popen[str]:
-        self.log_queue.put(f"{tag} $ {' '.join(cmd)}\n")
+    @staticmethod
+    def _format_cmd_for_log(cmd: list[str]) -> str:
+        out: list[str] = []
+        skip_next = False
+        for i, part in enumerate(cmd):
+            if skip_next:
+                out.append("***")
+                skip_next = False
+                continue
+            out.append(part)
+            if part == "--passphrase" and i + 1 < len(cmd):
+                skip_next = True
+        return " ".join(out)
+
+    def _spawn(self, cmd: list[str], tag: str, extra_env: dict[str, str] | None = None) -> subprocess.Popen[str]:
+        self.log_queue.put(f"{tag} $ {self._format_cmd_for_log(cmd)}\n")
+        env = os.environ.copy()
+        if extra_env:
+            env.update(extra_env)
         proc = subprocess.Popen(
             cmd,
             cwd=self.base_dir,
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -316,18 +378,39 @@ class DialupGUI(tk.Tk):
         fill, outline = mapping.get(color, mapping["red"])
         self.lamp_canvas.itemconfig(self.lamp_led, fill=fill, outline=outline)
 
+    @staticmethod
+    def _sanitize_ascii(text: str, limit: int = 120) -> str:
+        out = []
+        for ch in text:
+            if ch in ("\n", "\r", "\t"):
+                out.append(" ")
+            elif 32 <= ord(ch) <= 126:
+                out.append(ch)
+            else:
+                out.append(".")
+        return "".join(out).strip()[:limit]
+
+    @staticmethod
+    def _extract_event_payload(line: str, tag: str) -> str | None:
+        pattern = rf"^(?:\[(?:SEND|RECV)\]\s+)?\[{re.escape(tag)}\]\s*(.*)$"
+        m = re.match(pattern, line.strip())
+        if not m:
+            return None
+        return m.group(1).strip()
+
     def _append_preview(self, text: str) -> None:
-        if not text:
+        safe_text = self._sanitize_ascii(text)
+        if not safe_text:
             self.preview_text.configure(state="normal")
             self.preview_text.delete("1.0", "end")
             self.preview_text.configure(state="disabled")
             self.last_ascii = ""
             return
-        if text == self.last_ascii:
+        if safe_text == self.last_ascii:
             return
-        self.last_ascii = text
+        self.last_ascii = safe_text
         self.preview_text.configure(state="normal")
-        self.preview_text.insert("end", text + "\n")
+        self.preview_text.insert("end", safe_text + "\n")
         self.preview_text.see("end")
         if float(self.preview_text.index("end-1c").split(".")[0]) > 8:
             self.preview_text.delete("1.0", "2.0")
@@ -350,35 +433,38 @@ class DialupGUI(tk.Tk):
         self.span_canvas.create_line(0, h - 6, w, h - 6, fill="#3f4b52")
 
     def _handle_event_line(self, line: str) -> None:
-        s = line.strip()
-        if "[TXPROG]" in s:
+        tx_payload = self._extract_event_payload(line, "TXPROG")
+        if tx_payload is not None:
             try:
-                val = float(s.split("[TXPROG]", 1)[1].strip())
+                val = float(tx_payload)
                 self.send_progress.configure(value=max(0.0, min(100.0, val)))
             except ValueError:
                 pass
-        if "[RXPROG]" in s:
+        rx_payload = self._extract_event_payload(line, "RXPROG")
+        if rx_payload is not None:
             try:
-                val = float(s.split("[RXPROG]", 1)[1].strip())
+                val = float(rx_payload)
                 self.recv_progress.configure(value=max(0.0, min(100.0, val)))
             except ValueError:
                 pass
-        if "[LAMP]" in s:
-            val = s.split("[LAMP]", 1)[1].strip().lower()
+        lamp_payload = self._extract_event_payload(line, "LAMP")
+        if lamp_payload is not None:
+            val = lamp_payload.lower()
             if "green" in val:
                 self._set_lamp("green")
             elif "yellow" in val:
                 self._set_lamp("yellow")
             else:
                 self._set_lamp("red")
-        if "[ASCII]" in s:
-            text = s.split("[ASCII]", 1)[1].strip()
+        ascii_payload = self._extract_event_payload(line, "ASCII")
+        if ascii_payload is not None:
+            text = self._sanitize_ascii(ascii_payload)
             if text:
                 self._append_preview(text)
-        if "[SPAN]" in s:
-            payload = s.split("[SPAN]", 1)[1].strip()
+        span_payload = self._extract_event_payload(line, "SPAN")
+        if span_payload is not None:
             try:
-                bins = [int(x) for x in payload.split(",") if x.strip()][:64]
+                bins = [int(x) for x in span_payload.split(",") if x.strip()][:64]
                 if bins:
                     self._draw_spectrum(bins)
             except ValueError:
