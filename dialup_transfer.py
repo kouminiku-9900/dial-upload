@@ -313,8 +313,14 @@ def synthesize_samples(bits: list[int], sample_rate: int, baud: int, f0: int, f1
     sym1 = [int(amp * math.sin(2.0 * math.pi * f1 * i / sample_rate)) for i in range(n)]
 
     out: list[int] = []
-    for bit in bits:
+    total = max(len(bits), 1)
+    last_emit = 0.0
+    for i, bit in enumerate(bits, start=1):
         out.extend(sym1 if bit else sym0)
+        pct = (i / total) * 70.0
+        if pct - last_emit >= 2.0 or i == total:
+            print(f"[TXPROG] {pct:.1f}")
+            last_emit = pct
     return out
 
 
@@ -360,6 +366,40 @@ def goertzel_power(samples: list[int], freq: int, sample_rate: int) -> float:
         q2 = q1
         q1 = q0
     return q1 * q1 + q2 * q2 - q1 * q2 * coeff
+
+
+def spectrum_bins(samples: list[int], sample_rate: int, bins: int = 24) -> list[int]:
+    if not samples:
+        return [0] * bins
+    start_hz = 350
+    end_hz = 3400
+    freqs = [
+        int(start_hz + (end_hz - start_hz) * i / max(bins - 1, 1))
+        for i in range(bins)
+    ]
+    powers = [goertzel_power(samples, f, sample_rate) for f in freqs]
+    peak = max(powers) if powers else 1.0
+    if peak <= 0:
+        return [0] * bins
+    return [int(min(99.0, (p / peak) * 99.0)) for p in powers]
+
+
+def faux_text_from_audio(samples: list[int]) -> str:
+    if not samples:
+        return ""
+    charset = "01ABCDEF$%#@*+-=<>?"
+    step = max(1, len(samples) // 12)
+    out: list[str] = []
+    for i in range(0, len(samples), step):
+        seg = samples[i : i + step]
+        if not seg:
+            break
+        avg = sum(abs(x) for x in seg) / len(seg)
+        idx = int(avg / 800) % len(charset)
+        out.append(charset[idx])
+        if len(out) >= 24:
+            break
+    return "".join(out)
 
 
 def demod_bits(samples: list[int], sample_rate: int, baud: int, f0: int, f1: int) -> tuple[list[int], int]:
@@ -473,14 +513,44 @@ def record_from_mic(seconds: float, sample_rate: int) -> list[int]:
             "Mic capture needs python package 'sounddevice'. Install with: pip install sounddevice"
         ) from e
 
-    total = int(seconds * sample_rate)
-    data = sd.rec(total, samplerate=sample_rate, channels=1, dtype="float32")
-    sd.wait()
-
     out: list[int] = []
-    for row in data:
-        val = int(max(-1.0, min(1.0, float(row[0]))) * 32767)
-        out.append(val)
+    started = time.time()
+    last_emit = 0.0
+    blocksize = int(sample_rate * 0.18)
+    if blocksize < 64:
+        blocksize = 64
+
+    def callback(indata, frames, _time_info, status) -> None:  # type: ignore[no-untyped-def]
+        nonlocal out, last_emit
+        if status:
+            print(f"[ACOUSTIC RECV] audio status: {status}")
+        for i in range(frames):
+            val = int(max(-1.0, min(1.0, float(indata[i][0]))) * 32767)
+            out.append(val)
+
+        elapsed = time.time() - started
+        ratio = min(1.0, elapsed / max(seconds, 1e-6))
+        now = time.time()
+        if now - last_emit >= 0.25:
+            last_emit = now
+            print(f"[RXPROG] {ratio * 100.0:.1f}")
+            bins = spectrum_bins(out[-blocksize:], sample_rate, bins=28)
+            print("[SPAN] " + ",".join(str(v) for v in bins))
+            faux = faux_text_from_audio(out[-blocksize:])
+            if faux:
+                print(f"[ASCII] {faux}")
+
+    with sd.InputStream(
+        samplerate=sample_rate,
+        channels=1,
+        dtype="float32",
+        blocksize=blocksize,
+        callback=callback,
+    ):
+        end_at = time.time() + seconds
+        while time.time() < end_at:
+            time.sleep(0.05)
+    print("[RXPROG] 100.0")
     return out
 
 
@@ -498,8 +568,11 @@ def acoustic_send(
 
     frame = build_acoustic_frame(file_path)
     bits = build_packet_bits(frame)
+    print("[TXPROG] 0.0")
     samples = synthesize_samples(bits, sample_rate, baud, f0, f1)
+    print("[TXPROG] 80.0")
     write_wav(samples, sample_rate, wav_out)
+    print("[TXPROG] 90.0")
 
     duration = len(samples) / sample_rate
     print(f"[ACOUSTIC SEND] WAV written: {wav_out}")
@@ -510,6 +583,7 @@ def acoustic_send(
         print("[ACOUSTIC SEND] Playing from speaker now...")
         play_wav(wav_out, sample_rate, samples)
         print("[ACOUSTIC SEND] Playback finished.")
+    print("[TXPROG] 100.0")
 
 
 def acoustic_receive(
@@ -522,13 +596,19 @@ def acoustic_receive(
     record_seconds: float,
     save_recorded_wav: Path | None,
 ) -> None:
+    print("[LAMP] RED")
+    print("[RXPROG] 0.0")
     if wav_in:
         read_rate, samples = read_wav_mono16(wav_in)
         if read_rate != sample_rate:
             raise ValueError(f"wav sample rate mismatch: expected {sample_rate}, got {read_rate}")
         print(f"[ACOUSTIC RECV] Decoding WAV: {wav_in}")
+        print("[RXPROG] 50.0")
+        bins = spectrum_bins(samples[: int(sample_rate * 0.2)], sample_rate, bins=28)
+        print("[SPAN] " + ",".join(str(v) for v in bins))
     else:
         DialupFX.startup("ACOUSTIC microphone")
+        print("[LAMP] YELLOW")
         print(f"[ACOUSTIC RECV] Recording from mic for {record_seconds:.1f}s ...")
         samples = record_from_mic(record_seconds, sample_rate)
         print("[ACOUSTIC RECV] Recording complete.")
@@ -536,8 +616,13 @@ def acoustic_receive(
             write_wav(samples, sample_rate, save_recorded_wav)
             print(f"[ACOUSTIC RECV] Raw recording saved: {save_recorded_wav}")
 
+    print("[ACOUSTIC RECV] Demodulating...")
     frame = decode_packet_from_samples(samples, sample_rate, baud, f0, f1)
+    print("[RXPROG] 92.0")
     header, payload = parse_acoustic_frame(frame)
+    preview = payload[:240].decode("utf-8", errors="ignore").replace("\n", " ")
+    if preview:
+        print(f"[ASCII] {preview[:120]}")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     target = unique_target(out_dir, str(header.get("filename", "received.bin")))
@@ -546,10 +631,13 @@ def acoustic_receive(
     expected = str(header.get("sha256", ""))
     actual = hashlib.sha256(payload).hexdigest()
     if expected and expected != actual:
+        print("[LAMP] RED")
         raise ValueError("decoded checksum mismatch")
 
     print(f"[ACOUSTIC RECV] Saved: {target}")
     print("[ACOUSTIC RECV] Checksum OK")
+    print("[RXPROG] 100.0")
+    print("[LAMP] GREEN")
 
 
 def build_parser() -> argparse.ArgumentParser:

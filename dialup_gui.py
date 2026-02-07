@@ -21,6 +21,7 @@ class DialupGUI(tk.Tk):
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.receiver_proc: subprocess.Popen[str] | None = None
         self.sender_proc: subprocess.Popen[str] | None = None
+        self.last_ascii = ""
 
         self._build_ui()
         self.after(120, self._drain_logs)
@@ -81,6 +82,32 @@ class DialupGUI(tk.Tk):
         self.stop_recv_btn = ttk.Button(btns, text="Stop Receiver", command=self.stop_receiver, state="disabled")
         self.stop_recv_btn.pack(side="left")
 
+        status = ttk.Frame(parent)
+        status.grid(row=8, column=1, sticky="ew", pady=(10, 2))
+        status.columnconfigure(1, weight=1)
+        ttk.Label(status, text="Receive Progress").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.recv_progress = ttk.Progressbar(status, mode="determinate", maximum=100)
+        self.recv_progress.grid(row=0, column=1, sticky="ew")
+
+        lamp_row = ttk.Frame(parent)
+        lamp_row.grid(row=9, column=1, sticky="w", pady=(8, 4))
+        ttk.Label(lamp_row, text="Receive Lamp").pack(side="left", padx=(0, 8))
+        self.lamp_canvas = tk.Canvas(lamp_row, width=20, height=20, highlightthickness=0)
+        self.lamp_canvas.pack(side="left")
+        self.lamp_led = self.lamp_canvas.create_oval(2, 2, 18, 18, fill="#9a1f1f", outline="#451010")
+
+        preview_wrap = ttk.LabelFrame(parent, text="Live Data Text", padding=6)
+        preview_wrap.grid(row=10, column=1, sticky="ew", pady=(4, 4))
+        self.preview_text = tk.Text(preview_wrap, height=4, wrap="word", font=("Courier", 10))
+        self.preview_text.pack(fill="x", expand=True)
+        self.preview_text.configure(state="disabled")
+
+        span_wrap = ttk.LabelFrame(parent, text="Live Spana", padding=6)
+        span_wrap.grid(row=11, column=1, sticky="ew", pady=(4, 2))
+        self.span_canvas = tk.Canvas(span_wrap, width=560, height=110, bg="#0c0f10", highlightthickness=0)
+        self.span_canvas.pack(fill="x", expand=True)
+        self._draw_spectrum([0] * 28)
+
     def _build_send_tab(self, parent: ttk.Frame) -> None:
         self.send_transport = tk.StringVar(value="lan")
         self.send_host = tk.StringVar(value="127.0.0.1")
@@ -112,6 +139,13 @@ class DialupGUI(tk.Tk):
         self.send_btn = ttk.Button(parent, text="Send File", command=self.send_once)
         self.send_btn.grid(row=7, column=1, sticky="w")
 
+        progress_row = ttk.Frame(parent)
+        progress_row.grid(row=8, column=1, sticky="ew", pady=(8, 2))
+        progress_row.columnconfigure(1, weight=1)
+        ttk.Label(progress_row, text="Send Progress").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.send_progress = ttk.Progressbar(progress_row, mode="determinate", maximum=100)
+        self.send_progress.grid(row=0, column=1, sticky="ew")
+
         parent.columnconfigure(1, weight=1)
 
     @staticmethod
@@ -141,6 +175,10 @@ class DialupGUI(tk.Tk):
             return
 
         transport = self.recv_transport.get().strip().lower()
+        self.recv_progress.configure(value=0)
+        self._set_lamp("red")
+        self._append_preview("")
+        self._draw_spectrum([0] * 28)
         if transport == "acoustic":
             cmd = [
                 sys.executable,
@@ -206,6 +244,7 @@ class DialupGUI(tk.Tk):
             return
 
         transport = self.send_transport.get().strip().lower()
+        self.send_progress.configure(value=0)
         if transport == "acoustic":
             cmd = [
                 sys.executable,
@@ -245,6 +284,8 @@ class DialupGUI(tk.Tk):
             return
         code = self.sender_proc.wait()
         self.log_queue.put(f"[SEND] Process exited with code {code}\n")
+        if code != 0:
+            self.log_queue.put("[SEND] [TXPROG] 0.0\n")
         self.sender_proc = None
         self.after(0, lambda: self.send_btn.configure(state="normal"))
 
@@ -266,6 +307,83 @@ class DialupGUI(tk.Tk):
         for line in proc.stdout:
             self.log_queue.put(f"{tag} {line}")
 
+    def _set_lamp(self, color: str) -> None:
+        mapping = {
+            "red": ("#a11f1f", "#451010"),
+            "yellow": ("#bfa31c", "#595018"),
+            "green": ("#18a150", "#0d4a23"),
+        }
+        fill, outline = mapping.get(color, mapping["red"])
+        self.lamp_canvas.itemconfig(self.lamp_led, fill=fill, outline=outline)
+
+    def _append_preview(self, text: str) -> None:
+        if not text:
+            self.preview_text.configure(state="normal")
+            self.preview_text.delete("1.0", "end")
+            self.preview_text.configure(state="disabled")
+            self.last_ascii = ""
+            return
+        if text == self.last_ascii:
+            return
+        self.last_ascii = text
+        self.preview_text.configure(state="normal")
+        self.preview_text.insert("end", text + "\n")
+        self.preview_text.see("end")
+        if float(self.preview_text.index("end-1c").split(".")[0]) > 8:
+            self.preview_text.delete("1.0", "2.0")
+        self.preview_text.configure(state="disabled")
+
+    def _draw_spectrum(self, bins: list[int]) -> None:
+        self.span_canvas.delete("all")
+        w = int(self.span_canvas.winfo_width() or 560)
+        h = int(self.span_canvas.winfo_height() or 110)
+        n = max(1, len(bins))
+        bw = max(2, w // n)
+        for i, v in enumerate(bins):
+            x0 = i * bw + 1
+            x1 = x0 + bw - 2
+            height = int((max(0, min(99, v)) / 99.0) * (h - 14))
+            y0 = h - 6 - height
+            y1 = h - 6
+            color = "#3db8ff" if v < 70 else "#8ef77f"
+            self.span_canvas.create_rectangle(x0, y0, x1, y1, fill=color, outline="")
+        self.span_canvas.create_line(0, h - 6, w, h - 6, fill="#3f4b52")
+
+    def _handle_event_line(self, line: str) -> None:
+        s = line.strip()
+        if "[TXPROG]" in s:
+            try:
+                val = float(s.split("[TXPROG]", 1)[1].strip())
+                self.send_progress.configure(value=max(0.0, min(100.0, val)))
+            except ValueError:
+                pass
+        if "[RXPROG]" in s:
+            try:
+                val = float(s.split("[RXPROG]", 1)[1].strip())
+                self.recv_progress.configure(value=max(0.0, min(100.0, val)))
+            except ValueError:
+                pass
+        if "[LAMP]" in s:
+            val = s.split("[LAMP]", 1)[1].strip().lower()
+            if "green" in val:
+                self._set_lamp("green")
+            elif "yellow" in val:
+                self._set_lamp("yellow")
+            else:
+                self._set_lamp("red")
+        if "[ASCII]" in s:
+            text = s.split("[ASCII]", 1)[1].strip()
+            if text:
+                self._append_preview(text)
+        if "[SPAN]" in s:
+            payload = s.split("[SPAN]", 1)[1].strip()
+            try:
+                bins = [int(x) for x in payload.split(",") if x.strip()][:64]
+                if bins:
+                    self._draw_spectrum(bins)
+            except ValueError:
+                pass
+
     def _terminate(self, proc: subprocess.Popen[str], tag: str) -> None:
         if proc.poll() is not None:
             return
@@ -285,6 +403,7 @@ class DialupGUI(tk.Tk):
                 line = self.log_queue.get_nowait()
             except queue.Empty:
                 break
+            self._handle_event_line(line)
             wrote = True
             self.log_text.configure(state="normal")
             self.log_text.insert("end", line)
