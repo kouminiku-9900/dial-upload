@@ -2,16 +2,16 @@
 
 Windows と macOS 間で、`dial-up` 風の演出を楽しみながらファイル転送するミニアプリです。
 
-- ローカルネットワーク (LAN) で動作
-- 送受信ともに Python 標準ライブラリのみ
-- あえて遅い転送速度 (`--speed-kbps`) を設定可能
-- `--chaos` でランダム遅延・ビープ音の懐かし演出
+- LANモード（TCP）
+- Acousticモード（スピーカー送信 + マイク受信）
+- わざと遅い転送速度の演出
 - GUI あり（ワンクリック起動/停止スターター付き）
 
 ## 必要環境
 
 - Python 3.10+
-- Windows / macOS / Linux
+- Windows / macOS
+- Acoustic モードでマイク録音する場合: `pip install sounddevice`
 
 ## GUI（おすすめ）
 
@@ -25,40 +25,60 @@ Windows と macOS 間で、`dial-up` 風の演出を楽しみながらファイ�
 - 起動: `start_gui_mac.command`
 - 停止: `stop_gui_mac.command`
 
-`start` をダブルクリックすると GUI が起動します。
+GUI では `Transport` を `lan` / `acoustic` から選べます。
 
-## CLI 使い方
+## LANモード（CLI）
 
-### 1) 受信側を起動（例: Mac 側）
+### 受信側
 
 ```bash
 python3 dialup_transfer.py receive --port 5050 --out-dir received --speed-kbps 42 --chaos
 ```
 
-起動後、`Share this address with sender: 192.168.x.x:5050` の表示を送信側へ共有します。
-
-### 2) 送信側からファイル送信（例: Windows 側）
+### 送信側
 
 ```bash
 python3 dialup_transfer.py send --host 192.168.x.x --port 5050 --file ./photo.zip --speed-kbps 42 --chaos
 ```
 
+## Acousticモード（CLI）
+
+### 1) 受信側（マイク録音）
+
+```bash
+python3 dialup_transfer.py acoustic-receive --out-dir received --record-seconds 30
+```
+
+### 2) 送信側（スピーカー再生）
+
+```bash
+python3 dialup_transfer.py acoustic-send --file ./photo.zip
+```
+
+- まず受信側を録音開始してから、送信側を再生してください。
+- ノイズに弱いので、最初は短いファイルでテスト推奨です。
+
+### WAV経由のデバッグ
+
+送信WAVだけ作る:
+
+```bash
+python3 dialup_transfer.py acoustic-send --file ./photo.zip --no-play --wav-out tx.wav
+```
+
+WAVを直接デコード:
+
+```bash
+python3 dialup_transfer.py acoustic-receive --wav-in tx.wav --out-dir received
+```
+
 ## Tips
 
-- もっと遅くする: `--speed-kbps 9.6`
-- 少し快適にする: `--speed-kbps 128`
-- `--chaos` なしにすると安定転送
+- もっと遅くしたい: `--baud 40`
+- 安定寄り: `--baud 100` と音量調整
+- LANは `--speed-kbps 9.6` で超低速演出
 
-## トラブルシュート
+## 注意
 
-- 接続できない場合:
-  - 送受信端末が同じネットワークにいるか確認
-  - ポート `5050` が OS ファイアウォールで許可されているか確認
-- 受信ファイルが重複した場合:
-  - `file.txt`, `file_1.txt`, `file_2.txt` のように自動採番されます
-
-## 次ステップ案
-
-- GUI をさらにレトロ演出強化（接続音、CRT風エフェクト）
-- QR コードで送信先 IP を簡単共有
-- E2E 暗号化とワンタイム合言葉
+- Acousticモードは遊び用途の簡易実装です。周囲ノイズやスピーカー/マイク品質で成功率が変わります。
+- 実用性優先なら LAN モードを使ってください。
